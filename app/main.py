@@ -10,6 +10,13 @@
 pattern，此后每条成功写入的样本经流式 KMP 自动机精确匹配（允许重叠）。
 自动机只保存标量状态，不保存原始样本、不占用样本容量，故样本回收与
 片段增删均不影响识别进度；命中记录在样本回收后仍然保留。
+
+会话可在任意时刻分叉为一条独立续采的新会话：复制当时的 H、C、存活样本、
+全部未删除片段及其编号、下一样本与片段编号，以及模式配置、自动机进度、
+累计命中与最近 100 次命中记录。分叉只复制存活状态：已回收样本不恢复，
+也不重放样本重新识别（直接复制自动机标量状态）。分叉在来源会话锁内完成
+取号与快照，等效于与来源已有操作串行执行的某个时刻；来源保持不变，
+两支此后的写入、触发、删除、调参与模式操作互不影响。不提供合并与落盘。
 """
 from __future__ import annotations
 
@@ -278,6 +285,36 @@ class Session:
     def status_of(self, frag: Fragment) -> str:
         return "completed" if frag.end < self.next_seq else "pending"
 
+    # ---- 分叉 ----
+
+    def fork(self, new_id: int) -> "Session":
+        """以当前快照派生出一条独立续采的新会话。
+
+        复制 H、C、存活样本、全部未删除片段及其编号、下一样本与片段编号，
+        以及模式配置、自动机标量进度、累计命中与最近 100 次命中记录。
+        只复制存活状态：已回收样本不恢复，也不重放样本重新识别——自动机的
+        state/failure 与 hit_count、recent_hits 原样拷贝，两支后续识别各自独立。
+        调用方保证在来源锁内取号并调用本方法，故快照对应与来源操作串行的
+        某个确定时刻；来源自身不做任何修改。
+        """
+        child = Session(new_id, self.history, self.capacity)
+        child.next_seq = self.next_seq
+        child.samples = dict(self.samples)
+        child.fragments = {
+            fid: Fragment(f.fragment_id, f.center, f.before, f.after)
+            for fid, f in self.fragments.items()
+        }
+        child.next_fragment_id = self.next_fragment_id
+        child.pattern_configured = self.pattern_configured
+        if self.pattern is not None:
+            child.pattern = list(self.pattern)
+            child.matcher = PatternMatcher(child.pattern)
+            child.matcher.failure = list(self.matcher.failure)
+            child.matcher.state = self.matcher.state
+        child.hit_count = self.hit_count
+        child.recent_hits = deque(self.recent_hits, maxlen=100)
+        return child
+
 
 # ---------------- 会话注册表（单进程内存） ----------------
 
@@ -354,6 +391,24 @@ async def get_session(session_id: int) -> dict:
     sess = _get_session(session_id)
     async with sess.lock:
         return _session_summary(sess)
+
+
+@app.post("/sessions/{session_id}/fork", status_code=201)
+async def fork_session(session_id: int) -> dict:
+    """把来源会话分叉为可独立续采的新会话。
+
+    取号与快照复制都在来源会话锁内完成：分叉等效于排在来源某个已完成操作
+    之后执行，不会混合两个时刻的状态，来源保持不变。新 ID 与普通创建共用
+    同一个递增计数器，故每次分叉都得到不同且不冲突的 ID。来源不存在返回 404。
+    返回值是新会话的原会话查询结果（其中 session_id 为新 ID）。
+    """
+    sess = _get_session(session_id)
+    async with sess.lock:
+        new_id = registry.next_id
+        registry.next_id += 1
+        child = sess.fork(new_id)
+        registry.sessions[new_id] = child
+        return _session_summary(child)
 
 
 @app.put("/sessions/{session_id}/limits")

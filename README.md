@@ -24,6 +24,14 @@
   pattern，此后按成功写入的连续样本值精确匹配，**允许重叠**（pattern 可以长于 `H` 和 `C`）。
   识别只保存流式自动机的标量状态，**不保存原始样本、不占用样本容量**；片段触发、片段删除、
   样本回收都不改变识别进度，命中记录在回收后依然保留。容量拒绝不推进匹配状态，重试成功只识别一次。
+- **会话分叉**：`POST /sessions/{sid}/fork` 把当前采样会话复制为一条可独立续采的新会话。
+  复制当时的 `H`、`C`、存活样本、全部未删除片段及其编号、下一样本与片段编号，以及模式配置、
+  自动机匹配进度、累计命中数和最近 100 次命中记录；**已回收样本不恢复，也不重放样本重新识别**
+  （直接复制自动机标量状态）。分叉在来源会话锁内取号并快照，等效于与来源已有操作串行执行的某个
+  时刻，**不会混合两个时刻的状态**；来源本身保持不变。每次分叉都产生不同的、且与普通创建不冲突
+  的新 `session_id`（共用同一个递增 ID 计数器），来源不存在返回 `404`，成功返回含新 `session_id`
+  的**原会话查询结果**。分叉后两边的写入、触发、删除、参数调整和模式操作**互不影响**，各自继续
+  遵守原容量与校验规则；待完成片段在各分支分别等待各自的后续样本。不提供合并，也不落盘。
 
 ## 启动
 
@@ -50,6 +58,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | --- | --- | --- |
 | POST | `/sessions` | 创建会话，指定 `history`(H)、`capacity`(C) |
 | GET | `/sessions/{sid}` | 查看会话状态（已用容量、存活序号、片段列表） |
+| POST | `/sessions/{sid}/fork` | 分叉出一条独立续采的新会话，返回含新 `session_id` 的会话状态（来源不存在返回 `404`） |
 | PUT | `/sessions/{sid}/limits` | 不停采样地调整 `history`(H) 与 `capacity`(C)，返回会话状态 |
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
 | PUT | `/sessions/{sid}/pattern` | 在首条样本写入前配置识别 pattern（1～32 个整数，仅一次） |
@@ -311,6 +320,87 @@ curl -s -X POST http://localhost:8000/sessions/5/samples \
   -H 'Content-Type: application/json' -d '{"value": 50}'
 # {"seq":5,"value":50}   —— 扩容后重试成功，序号连续，片段内容与编号不变
 ```
+
+### 13. 分叉会话，两支分别独立续采
+
+把会话 5 在当前时刻（`next_seq=6`，片段 1 已完成，引用序号 2–4）分叉为新会话。
+新 ID 与普通创建共用同一递增计数器，故每次分叉得到不同且不冲突的 ID；返回值是
+**新会话**的原会话查询结果（除 `session_id` 外与来源一致）：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/5/fork
+# {"session_id":6,"history":2,"capacity":4,"next_seq":6,"used":4,
+#  "stored_seqs":[2,3,4,5],"fragments":[1]}
+
+curl -s -X POST http://localhost:8000/sessions/5/fork
+# {"session_id":7,"history":2,"capacity":4,"next_seq":6,"used":4,
+#  "stored_seqs":[2,3,4,5],"fragments":[1]}
+```
+
+分叉只复制当时仍存活的内容：片段编号、下一样本序号都原样延续（两支的下一条都是 `seq=6`），
+已回收的序号 1 **不会恢复**，也不会重放样本重新识别——自动机进度、累计命中与最近 100 次
+命中记录按当时快照直接复制。来源会话 5 本身保持不变：
+
+```bash
+curl -s http://localhost:8000/sessions/5
+# {"session_id":5,"history":2,"capacity":4,"next_seq":6,...,"fragments":[1]}
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/404/fork -o /dev/null -w '%{http_code}\n'
+# 404   —— 来源会话不存在
+```
+
+**在分支 6 续采**：分支 6 与来源同样处于 `C=4` 已占满状态，先只在该分支把容量扩到 5
+（参数调整互不影响来源与另一支），再写入 `seq=6` 并触发新片段，片段编号从复制来的
+`next_fragment_id=2` 继续：
+
+```bash
+curl -s -X PUT http://localhost:8000/sessions/6/limits \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 5}'
+# {"session_id":6,"history":2,"capacity":5,"next_seq":6,...,"stored_seqs":[2,3,4,5],"fragments":[1]}
+
+curl -s -X POST http://localhost:8000/sessions/6/samples \
+  -H 'Content-Type: application/json' -d '{"value": 60}'
+# {"seq":6,"value":60}
+
+curl -s -X POST http://localhost:8000/sessions/6/triggers \
+  -H 'Content-Type: application/json' -d '{"before": 1, "after": 0}'
+# {"fragment_id":2,"center":6,"before":1,"after":0,"start":5,"end":6,"status":"completed"}
+```
+
+**在分支 7 走另一条路**：删除复制来的片段 1（解除引用并回收），再触发编号同样为 2、
+但中心不同的片段——两支编号空间各自独立，写入与删除互不影响：
+
+```bash
+curl -s -X DELETE http://localhost:8000/sessions/7/fragments/1 -o /dev/null -w '%{http_code}\n'
+# 204
+
+curl -s -X POST http://localhost:8000/sessions/7/samples \
+  -H 'Content-Type: application/json' -d '{"value": 61}'
+# {"seq":6,"value":61}
+
+curl -s -X POST http://localhost:8000/sessions/7/triggers \
+  -H 'Content-Type: application/json' -d '{"before": 0, "after": 1}'
+# {"fragment_id":2,"center":6,"before":0,"after":1,"start":6,"end":7,"status":"pending"}
+```
+
+查询对比：分支 6 的片段 1 仍在、片段 2 中心为 6 且已完成；分支 7 的片段 1 已删除、
+片段 2 仍 `pending`（等待各自的 `seq=7`）；来源 5 完全不受两支影响：
+
+```bash
+curl -s http://localhost:8000/sessions/6
+# {"session_id":6,...,"next_seq":7,"stored_seqs":[2,3,4,5,6],"fragments":[1,2]}
+
+curl -s http://localhost:8000/sessions/7
+# {"session_id":7,...,"next_seq":7,"stored_seqs":[5,6],"fragments":[2]}
+
+curl -s http://localhost:8000/sessions/5
+# {"session_id":5,...,"next_seq":6,"stored_seqs":[2,3,4,5],"fragments":[1]}
+```
+
+分支 7 的待完成片段只等待分支 7 自己的后续样本，与分支 6 的 `seq=7` 无关；
+两支后续的容量拒绝、参数调整、模式配置等都各自按原规则独立校验。分叉不提供合并，
+服务仍为单进程内存态，重启后所有会话（含分支）都不保留。
 
 ## 本地开发（可选）
 
