@@ -10,6 +10,12 @@
 pattern，此后每条成功写入的样本经流式 KMP 自动机精确匹配（允许重叠）。
 自动机只保存标量状态，不保存原始样本、不占用样本容量，故样本回收与
 片段增删均不影响识别进度；命中记录在样本回收后仍然保留。
+
+会话分叉：POST /sessions/{sid}/fork 在来源会话锁内一次性复制当时的 H、C、
+存活样本、所有未删除片段及其编号、下一样本与片段编号、pattern 配置与自动机
+进度、累计命中与最近 100 次记录，产生可独立续采的新会话（已回收样本不恢复，
+也不重放样本重新识别）。新 ID 与普通创建共用全局递增序列；来源状态不变，
+分叉后两边互不影响，不提供合并与落盘。
 """
 from __future__ import annotations
 
@@ -278,6 +284,36 @@ class Session:
     def status_of(self, frag: Fragment) -> str:
         return "completed" if frag.end < self.next_seq else "pending"
 
+    @classmethod
+    def forked_from(cls, src: "Session", new_session_id: int) -> "Session":
+        """在来源会话锁内构造其分叉副本：深拷贝当时的全部状态。
+
+        复制 H、C、存活样本、所有未删除片段（含其编号）、下一样本与片段
+        编号、pattern 配置与自动机标量进度、累计命中与最近 100 次记录。
+        已回收样本没有来源可恢复，也不重放样本重新识别；待完成片段在新
+        分支中等待该分支自己的后续样本。新会话持有独立的锁与可变容器，
+        分叉后两边的写入、触发、删除、调参与模式操作互不影响。
+        """
+        fork = cls(new_session_id, src.history, src.capacity)
+        fork.samples = dict(src.samples)
+        fork.fragments = {
+            fid: Fragment(fid, f.center, f.before, f.after)
+            for fid, f in src.fragments.items()
+        }
+        fork.next_seq = src.next_seq
+        fork.next_fragment_id = src.next_fragment_id
+        fork.pattern = list(src.pattern) if src.pattern is not None else None
+        fork.pattern_configured = src.pattern_configured
+        if src.matcher is not None:
+            assert fork.pattern is not None
+            matcher = PatternMatcher(fork.pattern)
+            matcher.failure = list(src.matcher.failure)
+            matcher.state = src.matcher.state
+            fork.matcher = matcher
+        fork.hit_count = src.hit_count
+        fork.recent_hits = deque(src.recent_hits, maxlen=src.recent_hits.maxlen)
+        return fork
+
 
 # ---------------- 会话注册表（单进程内存） ----------------
 
@@ -285,6 +321,12 @@ class Registry:
     def __init__(self) -> None:
         self.sessions: dict[int, Session] = {}
         self.next_id = 1
+
+    def alloc_id(self) -> int:
+        """分配会话 ID：普通创建与分叉共用同一全局递增序列，互不冲突。"""
+        sid = self.next_id
+        self.next_id += 1
+        return sid
 
 
 registry = Registry()
@@ -343,10 +385,23 @@ async def root() -> dict:
 @app.post("/sessions", status_code=201)
 async def create_session(req: CreateSessionRequest) -> dict:
     # 单事件循环内无 await，创建过程天然原子
-    sid = registry.next_id
-    registry.next_id += 1
+    sid = registry.alloc_id()
     registry.sessions[sid] = Session(sid, req.history, req.capacity)
     return {"session_id": sid, "history": req.history, "capacity": req.capacity}
+
+
+@app.post("/sessions/{session_id}/fork", status_code=201)
+async def fork_session(session_id: int) -> dict:
+    # 来源不存在返回 404（与来源其他操作一致）
+    src = _get_session(session_id)
+    # ID 分配与快照都在来源锁内完成：分叉与来源已有操作等效于串行执行，
+    # 快照只可能对应某一时刻，不会混合两个时刻的状态；注册发生在同一同步段，
+    # 摘要也在锁内计算，保证返回内容严格等于分叉那一刻
+    async with src.lock:
+        new_sid = registry.alloc_id()
+        fork = Session.forked_from(src, new_sid)
+        registry.sessions[new_sid] = fork
+        return _session_summary(fork)
 
 
 @app.get("/sessions/{session_id}")

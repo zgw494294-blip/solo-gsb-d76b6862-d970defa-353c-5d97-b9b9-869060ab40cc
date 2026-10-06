@@ -24,6 +24,15 @@
   pattern，此后按成功写入的连续样本值精确匹配，**允许重叠**（pattern 可以长于 `H` 和 `C`）。
   识别只保存流式自动机的标量状态，**不保存原始样本、不占用样本容量**；片段触发、片段删除、
   样本回收都不改变识别进度，命中记录在回收后依然保留。容量拒绝不推进匹配状态，重试成功只识别一次。
+- **会话分叉（可选）**：`POST /sessions/{sid}/fork` 把当前采样会话分叉为可独立续采的新会话，
+  从同一进度写入各自的后续样本。一次性复制当时的 `H`、`C`、存活样本、所有未删除片段及其编号、
+  下一样本与片段编号，以及 pattern 配置、自动机匹配进度、累计命中数与最近 100 次命中记录；
+  **已回收样本不恢复，也不重放样本重新识别**。来源会话不存在返回 `404`；成功返回 `201` 与
+  **含新 `session_id` 的原会话查询结果**（与 `GET /sessions/{sid}` 同格式）。新 ID 与普通创建
+  共用全局递增序列，每次分叉都产生不同且不冲突的 ID。待完成片段在各分支等待各自的后续样本；
+  分叉与来源已有操作等效于串行执行，快照不会混合两个时刻的状态，**来源状态保持不变**。
+  分叉后两边的写入、触发、删除、参数调整与模式操作**互不影响**，各自遵守原容量与校验规则；
+  不提供合并，也不落盘。
 
 ## 启动
 
@@ -49,6 +58,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/sessions` | 创建会话，指定 `history`(H)、`capacity`(C) |
+| POST | `/sessions/{sid}/fork` | 分叉会话，复制当时全部进度为独立新会话，返回含新 `session_id` 的会话状态 |
 | GET | `/sessions/{sid}` | 查看会话状态（已用容量、存活序号、片段列表） |
 | PUT | `/sessions/{sid}/limits` | 不停采样地调整 `history`(H) 与 `capacity`(C)，返回会话状态 |
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
@@ -59,7 +69,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | GET | `/sessions/{sid}/fragments/{fid}` | 查询片段状态与样本内容 |
 | DELETE | `/sessions/{sid}/fragments/{fid}` | 删除片段（解除引用并回收样本） |
 
-错误码：`404` 会话/片段不存在；`409` 历史不足、容量不足、pattern 重复配置或已有样本后配置、
+错误码：`404` 会话/片段不存在（含分叉来源会话不存在）；`409` 历史不足、容量不足、pattern 重复配置或已有样本后配置、
 查询未配置 pattern 的会话、调整参数与存活样本或片段冲突（新历史窗口含已回收样本、
 未删除片段总长或所需序号并集超过新 `C`）；`400` 触发参数违反 `before < H` 或
 `before+1+after ≤ C`；`422` 请求体不合法（含 pattern 长度非法、元素为布尔值或字符串，
@@ -310,6 +320,142 @@ curl -s -X PUT http://localhost:8000/sessions/5/limits \
 curl -s -X POST http://localhost:8000/sessions/5/samples \
   -H 'Content-Type: application/json' -d '{"value": 50}'
 # {"seq":5,"value":50}   —— 扩容后重试成功，序号连续，片段内容与编号不变
+```
+
+### 13. 分叉会话：同一进度、各自续采、互不影响
+
+会话 6 以 `H=2, C=3` 创建，写入 3 条样本后触发一个 `after=1` 的待完成片段；
+此时序号 1 已被回收，片段引用序号 2–4（4 尚未写入）：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}'
+# {"session_id":6,"history":2,"capacity":3}
+
+for v in 10 20 30; do
+  curl -s -X POST http://localhost:8000/sessions/6/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+curl -s -X POST http://localhost:8000/sessions/6/triggers \
+  -H 'Content-Type: application/json' -d '{"before": 1, "after": 1}'
+# {"fragment_id":1,"center":3,"before":1,"after":1,"start":2,"end":4,"status":"pending"}
+```
+
+把会话 6 分叉两次；每次都返回 `201` 与含新 `session_id` 的原会话查询结果
+（`stored_seqs`、`fragments`、`next_seq` 与来源一致，已回收的序号 1 不恢复）。
+两个新 ID 彼此不同，且与随后普通创建的会话 ID 也不冲突：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/6/fork
+# {"session_id":7,"history":2,"capacity":3,"next_seq":4,"used":2,"stored_seqs":[2,3],"fragments":[1]}
+
+curl -s -X POST http://localhost:8000/sessions/6/fork
+# {"session_id":8,"history":2,"capacity":3,"next_seq":4,"used":2,"stored_seqs":[2,3],"fragments":[1]}
+
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 1, "capacity": 1}'
+# {"session_id":9,"history":1,"capacity":1}   —— 普通创建接在分叉 ID 之后
+```
+
+来源会话保持分叉那一刻的状态；待完成片段在三个分支中分别等待各自的后续样本：
+
+```bash
+curl -s http://localhost:8000/sessions/6
+# {"session_id":6,"history":2,"capacity":3,"next_seq":4,"used":2,"stored_seqs":[2,3],"fragments":[1]}
+
+# 来源分支与第一个分叉各自补齐 seq=4，两边片段独立完成
+curl -s -X POST http://localhost:8000/sessions/6/samples \
+  -H 'Content-Type: application/json' -d '{"value": 40}'
+# {"seq":4,"value":40}
+curl -s -X POST http://localhost:8000/sessions/7/samples \
+  -H 'Content-Type: application/json' -d '{"value": 44}'
+# {"seq":4,"value":44}
+
+curl -s http://localhost:8000/sessions/6/fragments/1
+# {"fragment_id":1,...,"status":"completed",
+#  "samples":[{"seq":2,"value":20},{"seq":3,"value":30},{"seq":4,"value":40}]}
+curl -s http://localhost:8000/sessions/7/fragments/1
+# {"fragment_id":1,...,"status":"completed",
+#  "samples":[{"seq":2,"value":20},{"seq":3,"value":30},{"seq":4,"value":44}]}
+
+# 第二个分叉没有写入，片段仍在等待它自己的后续样本
+curl -s http://localhost:8000/sessions/8/fragments/1
+# {"fragment_id":1,...,"status":"pending",
+#  "samples":[{"seq":2,"value":20},{"seq":3,"value":30}]}
+```
+
+删除、触发与参数调整也按分支独立：在分叉 7 上删除片段 1 并调整 H/C，
+来源与分叉 8 完全不受影响：
+
+```bash
+curl -s -X DELETE http://localhost:8000/sessions/7/fragments/1 -o /dev/null -w '%{http_code}\n'
+# 204
+curl -s -X PUT http://localhost:8000/sessions/7/limits \
+  -H 'Content-Type: application/json' -d '{"history": 1, "capacity": 2}'
+# {"session_id":7,"history":1,"capacity":2,"next_seq":5,"used":1,"stored_seqs":[4],"fragments":[]}
+
+curl -s http://localhost:8000/sessions/6
+# {"session_id":6,"history":2,"capacity":3,"next_seq":5,"used":3,"stored_seqs":[2,3,4],"fragments":[1]}
+curl -s http://localhost:8000/sessions/8
+# {"session_id":8,"history":2,"capacity":3,"next_seq":4,"used":2,"stored_seqs":[2,3],"fragments":[1]}
+```
+
+分叉不存在的来源会话返回 `404`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/99/fork
+# 404
+```
+
+### 14. 分叉复制匹配进度与命中记录，且不重放样本
+
+会话 10 在首条样本前配置 pattern `[1,1]`，写入三个 `1` 后产生两次重叠命中，
+此时序号 1 已被历史窗口回收：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}'
+# {"session_id":10,"history":2,"capacity":3}
+curl -s -X PUT http://localhost:8000/sessions/10/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [1, 1]}'
+# {"pattern":[1,1]}
+for v in 1 1 1; do
+  curl -s -X POST http://localhost:8000/sessions/10/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+curl -s http://localhost:8000/sessions/10/pattern/hits
+# {"pattern":[1,1],"hit_count":2,
+#  "recent_hits":[{"start_seq":1,"end_seq":2},{"start_seq":2,"end_seq":3}]}
+```
+
+分叉后新会话直接携带 pattern 配置、自动机标量进度（最后一个 `1` 已匹配前缀长度 1）、
+累计命中 2 次与最近 100 次记录；已回收的序号 1 不恢复，旧样本也不重放重新识别。
+在两个分支分别写入一个 `1`：自动机从同一进度继续，各自只新增一次命中 `(3,4)`：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/10/fork
+# {"session_id":11,...,"next_seq":4,"used":2,"stored_seqs":[2,3],"fragments":[]}
+
+curl -s -X POST http://localhost:8000/sessions/10/samples \
+  -H 'Content-Type: application/json' -d '{"value": 1}' > /dev/null
+curl -s -X POST http://localhost:8000/sessions/11/samples \
+  -H 'Content-Type: application/json' -d '{"value": 1}' > /dev/null
+
+curl -s http://localhost:8000/sessions/10/pattern/hits
+# {"pattern":[1,1],"hit_count":3,
+#  "recent_hits":[{"start_seq":1,"end_seq":2},{"start_seq":2,"end_seq":3},{"start_seq":3,"end_seq":4}]}
+curl -s http://localhost:8000/sessions/11/pattern/hits
+# {"pattern":[1,1],"hit_count":3,
+#  "recent_hits":[{"start_seq":1,"end_seq":2},{"start_seq":2,"end_seq":3},{"start_seq":3,"end_seq":4}]}
+```
+
+分叉副本已视为配置过 pattern（不能再次配置），与来源一致；未配置 pattern 的会话
+分叉后同样不能配置（若已写入样本），各分支继续各自遵守原有一次性配置规则：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://localhost:8000/sessions/11/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [2, 2]}'
+# 409   —— 分叉副本继承“已配置”状态，且首条样本已写入
 ```
 
 ## 本地开发（可选）
